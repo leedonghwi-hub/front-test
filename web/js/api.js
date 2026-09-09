@@ -1,0 +1,131 @@
+// web/js/api.js
+//
+// 백엔드 호출 전부. 화면 코드는 fetch를 직접 만지지 않는다 —
+// 계약(ListingOut)이 바뀌면 이 파일과 render.js만 보면 되게 하려는 것이다.
+
+import { PRICE_UNLIMITED, toQueryBrand } from './state.js';
+
+/**
+ * 백엔드가 프론트를 같은 출처에서 서빙하므로(app/main.py의 StaticFiles mount)
+ * 빈 문자열 = 상대 경로가 기본이다. 포트를 맞출 것도, CORS를 열 것도 없다.
+ *
+ * 프론트만 따로 호스팅하는 경우에만 절대 주소를 넣고, 그때는 백엔드 .env의
+ * ALLOWED_ORIGINS에 그 출처를 추가한다.
+ */
+export const API_BASE = '';
+
+async function getJSON(url, signal) {
+  const res = await fetch(url, { signal });
+
+  if (!res.ok) {
+    throw new Error(`서버가 ${res.status}로 응답했습니다.`);
+  }
+
+  return res.json();
+}
+
+/**
+ * 필터 상태 → 쿼리스트링.
+ *
+ * 필터는 서버가 건다. 받아온 한 페이지만 걸러내면 "전체에서 가장 싼 매물"이
+ * 아니라 "이 페이지에서 가장 싼 매물"이 된다. '전체'와 기본값은 아예 보내지
+ * 않는다 — 파라미터 부재가 곧 "필터 없음"이다.
+ */
+export function buildQuery(filters, offset, limit) {
+  const q = new URLSearchParams();
+
+  if (filters.category !== 'all') q.set('category', filters.category);
+  if (filters.brand && filters.brand !== '전체') q.set('brand', toQueryBrand(filters.brand));
+  if (filters.source && filters.source !== '전체') q.set('source', filters.source);
+  if (filters.q) q.set('search', filters.q);
+  if (filters.min > 0) q.set('min_price', String(filters.min));
+  if (filters.max < PRICE_UNLIMITED) q.set('max_price', String(filters.max));
+  if (filters.sort) q.set('order_by', filters.sort);
+  // 인증 매물만. 기본값(false)은 보내지 않는다 — 부재가 곧 "필터 없음"이다.
+  if (filters.authenticatedOnly) q.set('authenticated_only', 'true');
+
+  q.set('limit', String(limit));
+  q.set('offset', String(offset));
+
+  return q;
+}
+
+/**
+ * 매물 목록.
+ * @returns {Promise<{total:number,count:number,limit:number,offset:number,has_next:boolean,items:object[]}>}
+ */
+export function fetchListings(filters, offset, limit, signal) {
+  return getJSON(`${API_BASE}/api/products?${buildQuery(filters, offset, limit)}`, signal);
+}
+
+/**
+ * 검색어로 번개장터를 즉시 조회해 저장하도록 요청한다.
+ *
+ * 실패해도 서버가 200에 status='failed'를 담아 준다. 화면이 이미 DB 결과를 보여주고
+ * 있으므로 이 호출의 실패가 목록을 가려서는 안 되기 때문이다. 네트워크 자체가
+ * 끊긴 경우만 여기서 예외가 되고, 호출부가 그것도 삼킨다.
+ */
+export function fetchLive(query, signal) {
+  return getJSON(`${API_BASE}/api/live/search?q=${encodeURIComponent(query)}`, signal);
+}
+
+/** 입점 판매자 정보. 크롤링 매물에는 seller_id가 없으므로 호출하지 않는다. */
+export function fetchSeller(sellerId, signal) {
+  return getJSON(`${API_BASE}/api/sellers/${sellerId}`, signal);
+}
+
+/** 필터 선택지와 수집 현황 (브랜드·수집처·카테고리별 건수). */
+export function fetchMeta(signal) {
+  return getJSON(`${API_BASE}/api/meta`, signal);
+}
+
+/**
+ * 대문 추천 레일용. 최신순 상위 n건.
+ *
+ * 화면 필터와 무관하게 항상 같은 조건이라 filters를 받지 않는다 — 대문은
+ * "지금 뭐가 올라와 있나"를 보여주는 자리다.
+ */
+export async function fetchReco(limit = 50) {
+  const q = new URLSearchParams({ limit: String(limit), offset: '0', order_by: 'latest' });
+  const data = await getJSON(`${API_BASE}/api/products?${q}`);
+
+  return data.items;
+}
+
+/**
+ * 인기 매물. 클릭 많은 순, 직접등록이 앞 (app/db/clicks.list_popular).
+ * 응답 모양은 목록과 같아서 카드 렌더 코드를 그대로 쓴다.
+ */
+export async function fetchPopular(limit = 12) {
+  const data = await getJSON(`${API_BASE}/api/products/popular?limit=${limit}`);
+
+  return data.items;
+}
+
+/**
+ * 카드 클릭을 서버에 알린다. 응답을 기다리지 않는다.
+ *
+ * 크롤링 매물 카드는 누르는 순간 원문 사이트로 나가므로(새 탭이지만 현재 탭도
+ * 언로드될 수 있다) 보통의 fetch는 취소될 수 있다. sendBeacon은 페이지가
+ * 떠나도 브라우저가 전송을 끝내 주는 API라 그걸 먼저 쓰고, 없는 환경(jsdom 등)
+ * 에서는 keepalive fetch로 대신한다.
+ *
+ * 실패는 무시한다. 집계가 안 됐다고 사용자가 할 일은 없고, 카드 클릭의 본래
+ * 동작(원문 이동·판매자 시트)을 막아서도 안 된다.
+ */
+export function sendClick(itemId) {
+  const url = `${API_BASE}/api/events/click`;
+  const body = JSON.stringify({ item_id: Number(itemId) });
+
+  if (typeof navigator !== 'undefined' && typeof navigator.sendBeacon === 'function') {
+    if (navigator.sendBeacon(url, new Blob([body], { type: 'application/json' }))) return;
+  }
+
+  fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body,
+    keepalive: true,
+    credentials: 'same-origin',
+  }).catch(() => {});
+}
